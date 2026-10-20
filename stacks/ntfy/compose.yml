@@ -1,0 +1,23 @@
+# ntfy: push alerts to a phone.
+# Subscribe the phone app to ${NTFY_TOPIC} on the mesh HTTPS base URL.
+#
+# upstream-base-url: iOS wakes through Apple's push service via ntfy.sh.
+# ntfy.sh only gets a message ID; the phone fetches the text from this server.
+name: ntfy
+services:
+  ntfy:
+    image: binwiederhier/ntfy:latest
+    container_name: ntfy
+    restart: unless-stopped
+    command: serve
+    ports:
+      - "${NTFY_PORT:-8093}:80"
+    environment:
+      NTFY_BASE_URL: ${NTFY_BASE_URL:?set in .env}
+      NTFY_UPSTREAM_BASE_URL: https://ntfy.sh
+      NTFY_BEHIND_PROXY: "true"
+      NTFY_CACHE_FILE: /var/lib/ntfy/cache.db
+      NTFY_CACHE_DURATION: 72h
+      TZ: ${TZ:-UTC}
+    volumes:
+      - /DATA/AppData/ntfy:/var/lib/ntfy

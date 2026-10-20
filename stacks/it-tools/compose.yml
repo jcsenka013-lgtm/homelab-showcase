@@ -1,0 +1,9 @@
+# IT-Tools (stateless developer utilities).
+name: it-tools
+services:
+  it-tools:
+    image: corentinth/it-tools:latest
+    container_name: it-tools
+    restart: unless-stopped
+    ports:
+      - "${IT_TOOLS_PORT:-8082}:80"

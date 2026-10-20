@@ -1,0 +1,13 @@
+[Unit]
+Description=LAN-only filter for Docker published ports
+After=docker.service
+Requires=docker.service
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/docker-lan-filter.sh
+
+[Install]
+WantedBy=multi-user.target

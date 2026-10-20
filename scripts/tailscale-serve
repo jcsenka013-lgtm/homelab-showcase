@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Real HTTPS (via the mesh VPN client's serve) for selected apps, on mesh
+# devices only. Rule: HTTPS port = 10000 + the app's HTTP port. Homepage is
+# on plain 443. LAN http://10.0.0.10:<port> addresses keep working.
+#
+# Needs, once: sudo tailscale set --operator=$DEPLOY_USER
+# Re-runnable: resets and rebuilds the whole list. Undo: tailscale serve reset
+set -euo pipefail
+
+# https   http   app
+APPS="
+443     3000   homepage
+12283   2283   immich
+12342   2342   photoprism
+18088   8088   vaultwarden
+18010   8010   paperless
+13001   3001   uptime-kuma
+18090   8090   beszel
+18093   8093   ntfy
+"
+
+host=$(tailscale status --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))')
+tailscale serve reset
+while read -r https http app; do
+    [ -n "$https" ] || continue
+    tailscale serve --bg --https="$https" "http://127.0.0.1:$http" >/dev/null
+    url="https://$host"; [ "$https" = 443 ] || url="$url:$https"
+    printf '%-12s %s\n' "$app" "$url"
+done <<<"$APPS"

@@ -1,0 +1,64 @@
+# Environment files. Tracked examples stay addable: .env.example, *.env.example.
+.env
+.env.*
+*.env
+*.env.*
+!.env.example
+!*.env.example
+
+# Password-manager exports.
+vault-import/
+vault-import.json
+totp-aegis.json
+*[Bb]itwarden*.json
+*[Bb]itwarden*.csv
+*[Vv]aultwarden*.json
+*[Vv]aultwarden*.csv
+bitwarden_export*
+vaultwarden_export*
+*.1pux
+*.1pif
+*1[Pp]assword*.json
+*1[Pp]assword*.csv
+*[Oo]ne[Pp]assword*.json
+*[Oo]ne[Pp]assword*.csv
+*[Kk]eychain*.json
+*[Kk]eychain*.csv
+*.keychain
+*.keychain-db
+logins.json
+logins.csv
+*aegis*.json
+*.kdbx
+*.kdbx.*
+
+# Private keys and certs. Public keys (*.pub) stay trackable.
+id_*
+offbox_ed25519
+*.pem
+*.key
+*.p8
+*.p12
+*.pfx
+!*.pub
+
+# Database dumps and backup archives.
+*.sql
+*.sql.*
+*.dump
+*.tar.gz
+*.tgz
+*.tar.zst
+
+# App databases.
+*.sqlite
+*.sqlite3
+*.db
+
+# Local data / secrets directories.
+data/
+config/
+db/
+pgdata/
+secrets/
+secrets.*

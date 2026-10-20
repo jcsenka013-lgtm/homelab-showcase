@@ -1,0 +1,8 @@
+# Pushes "<unit> failed" plus its last log lines to the phone. Hook a unit up
+# with `OnFailure=notify-failure@%n.service` in its [Unit] section.
+[Unit]
+Description=Push an alert that %i failed
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'journalctl -u %i -n 20 -o cat --no-pager | /usr/local/bin/ntfy-send -p high -t warning "%i failed on homelab"'

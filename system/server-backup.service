@@ -1,0 +1,12 @@
+[Unit]
+Description=Nightly backup of app state to /srv/backup
+Requires=docker.service
+After=docker.service srv-backup.mount
+RequiresMountsFor=/srv/backup
+OnFailure=notify-failure@%n.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/server-backup
+Nice=10
+IOSchedulingClass=idle

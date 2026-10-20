@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# smartd's warning hook (-M exec in /etc/smartd.conf). smartd passes the details
+# in SMARTD_* variables. FULLMESSAGE may include model info from the drive —
+# treat alert text as sensitive on shared channels.
+case ${SMARTD_FAILTYPE:-} in
+    EmailTest) prio=low ;;
+    Temperature) prio=high ;;
+    *) prio=urgent ;;
+esac
+/usr/local/bin/ntfy-send -p "$prio" -t floppy_disk "Disk: ${SMARTD_FAILTYPE:-warning} on ${SMARTD_DEVICE:-?}" \
+    "${SMARTD_FULLMESSAGE:-${SMARTD_MESSAGE:-no details}}"

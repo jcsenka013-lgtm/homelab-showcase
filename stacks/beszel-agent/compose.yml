@@ -1,0 +1,17 @@
+# Beszel agent for the homelab server.
+# BESZEL_KEY is the hub's public key (not a secret), set in .env.
+name: beszel-agent
+services:
+  beszel-agent:
+    image: henrygd/beszel-agent:latest
+    container_name: beszel-agent
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /:/extra-filesystems/root:ro
+      - /srv/backup:/extra-filesystems/backup:ro
+      - ${BESZEL_POOL_MOUNT:-/srv/pool}:/extra-filesystems/pool:ro
+    environment:
+      PORT: ${BESZEL_AGENT_PORT:-45876}
+      KEY: ${BESZEL_KEY:?set in .env}

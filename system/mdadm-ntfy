@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# mdadm's PROGRAM hook (the PROGRAM line in /etc/mdadm/mdadm.conf), run by
+# mdmonitor as: <event> <md device> [member disk]
+event=$1 dev=$2 member=${3:-}
+case $event in
+    Fail|FailSpare|DegradedArray|DeviceDisappeared) prio=urgent ;;
+    RebuildStarted|RebuildFinished) prio=low ;;
+    Rebuild[0-9]*) exit 0 ;;
+    *) prio=default ;;
+esac
+/usr/local/bin/ntfy-send -p "$prio" -t floppy_disk "RAID: $event on $dev" \
+    "$event on $dev${member:+ (disk $member)}
+
+$(cat /proc/mdstat)"

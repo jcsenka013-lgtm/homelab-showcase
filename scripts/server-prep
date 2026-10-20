@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+# Idempotent host prep for the homelab server.
+# Run as: sudo scripts/server-prep [docker|disks|nfs|dirs|firewall|backup|alerts|sysctl|pool|appdata|all]
+# Safe to re-run; every step checks whether it is already done.
+# `all` is docker + sysctl + firewall + dirs + disks + backup. pool, nfs,
+# alerts, and appdata are opt-in (they need site paths or a live ntfy stack).
+#
+# Disk wipe steps prompt for the word "wipe". Identify real disks with
+# /dev/disk/by-id on the live host — this showcase intentionally omits hardware IDs.
+set -euo pipefail
+
+[ "$(id -u)" -eq 0 ] || { echo "run with sudo"; exit 1; }
+USER_NAME=${SUDO_USER:-${DEPLOY_USER:-deploy}}
+
+# Placeholders — set on the live host before running disks/nfs/pool steps.
+DISK_A=${BACKUP_DISK_A:-/dev/disk/by-id/ata-DISK_A_PLACEHOLDER}
+DISK_B=${BACKUP_DISK_B:-/dev/disk/by-id/ata-DISK_B_PLACEHOLDER}
+NFS_SOURCE=${NFS_SOURCE:-10.0.0.20:/export/storage}
+NFS_LINE="${NFS_SOURCE} /mnt/nfs/storage nfs proto=tcp,port=2049,nfsvers=4.2,rsize=1048576,wsize=1048576,hard,noatime,nofail,_netdev,x-systemd.automount 0 0"
+
+HERE=$(dirname "$(readlink -f "$0")")
+ROOT=$(dirname "$HERE")
+
+step_docker() {
+    echo "== docker: install engine + compose plugin"
+    apt-get install -y docker.io docker-compose-v2 docker-buildx
+
+    mkdir -p /etc/docker
+    cat > /etc/docker/daemon.json <<'EOF'
+{
+  "log-driver": "json-file",
+  "log-opts": { "max-size": "10m", "max-file": "3" },
+  "live-restore": true
+}
+EOF
+    usermod -aG docker "$USER_NAME"
+    systemctl enable docker.service docker.socket
+    systemctl restart docker.socket
+    systemctl start docker.service
+    docker ps --format '{{.Names}}\t{{.Status}}'
+}
+
+step_disks() {
+    echo "== disks: RAID1 -> /srv/backup"
+    if [ -e /dev/md/backup ]; then
+        echo "already exists:"; cat /proc/mdstat
+    else
+        for d in "$DISK_A" "$DISK_B"; do
+            [ -e "$d" ] || { echo "missing $d — set BACKUP_DISK_A/B to by-id paths"; exit 1; }
+            lsblk -no MOUNTPOINTS "$d" | grep -q . && { echo "$d is mounted, aborting"; exit 1; }
+        done
+        lsblk -o NAME,SIZE,FSTYPE,LABEL,MODEL "$(readlink -f "$DISK_A")" "$(readlink -f "$DISK_B")"
+        read -rp "ERASE both disks above? type 'wipe' to continue: " ans
+        [ "$ans" = wipe ] || { echo "skipped"; return; }
+
+        wipefs -a "$DISK_A" "$DISK_B"
+        mdadm --create /dev/md/backup --level=1 --raid-devices=2 --metadata=1.2 \
+              --name=backup --bitmap=internal "$DISK_A" "$DISK_B" --run
+        mkfs.ext4 -L backup -m 0 /dev/md/backup
+    fi
+
+    uuid=$(mdadm --detail --export /dev/md/backup | sed -n 's/^MD_UUID=//p')
+    if ! grep -q "$uuid" /etc/mdadm/mdadm.conf; then
+        mdadm --detail --brief /dev/md/backup >> /etc/mdadm/mdadm.conf
+        update-initramfs -u
+    fi
+
+    mkdir -p /srv/backup
+    grep -q 'LABEL=backup' /etc/fstab ||
+        echo 'LABEL=backup /srv/backup ext4 defaults,noatime,nofail 0 2' >> /etc/fstab
+    systemctl daemon-reload
+    mount /srv/backup 2>/dev/null || true
+    df -h /srv/backup
+}
+
+step_nfs() {
+    echo "== nfs: separate NAS -> /mnt/nfs/storage"
+    mkdir -p /mnt/nfs/storage
+    grep -q ' /mnt/nfs/storage ' /etc/fstab || echo "$NFS_LINE" >> /etc/fstab
+    systemctl daemon-reload
+    systemctl restart remote-fs.target
+    ls /mnt/nfs/storage | head || echo "!! mount failed: allow this host in the NAS exports"
+}
+
+step_firewall() {
+    echo "== firewall: LAN/mesh-only access to Docker published ports"
+    install -m 755 "$ROOT/system/docker-lan-filter.sh" /usr/local/sbin/docker-lan-filter.sh
+    install -m 644 "$ROOT/system/docker-lan-filter.service" /etc/systemd/system/docker-lan-filter.service
+    install -d /etc/systemd/system/docker.service.d
+    install -m 644 "$ROOT/system/docker.service.d-lan-filter.conf" /etc/systemd/system/docker.service.d/lan-filter.conf
+    systemctl daemon-reload
+    systemctl enable docker-lan-filter.service
+    systemctl restart docker-lan-filter.service
+    iptables -S DOCKER-USER; ip6tables -S DOCKER-USER
+}
+
+step_backup() {
+    echo "== backup: nightly server-backup.timer -> /srv/backup"
+    install -m 755 "$HERE/server-backup" /usr/local/sbin/server-backup
+    install -m 644 "$ROOT/system/server-backup.service" "$ROOT/system/server-backup.timer" /etc/systemd/system/
+    systemctl daemon-reload
+    systemctl enable --now server-backup.timer
+    systemctl list-timers server-backup.timer --no-pager
+
+    if [ ! -f /root/.ssh/offbox_ed25519 ]; then
+        install -d -m 700 /root/.ssh
+        ssh-keygen -q -t ed25519 -N '' -C "root@homelab offbox" -f /root/.ssh/offbox_ed25519
+    fi
+    install -D -m 644 /root/.ssh/offbox_ed25519.pub /etc/server-backup/offbox.pub
+    echo "off-box key: /etc/server-backup/offbox.pub (next: scripts/offbox-setup)"
+}
+
+step_sysctl() {
+    echo "== sysctl: raise inotify limits"
+    install -m 644 "$ROOT/system/60-inotify.conf" /etc/sysctl.d/60-inotify.conf
+    sysctl -p /etc/sysctl.d/60-inotify.conf
+}
+
+step_pool() {
+    echo "== pool: mergerfs at /srv/pool (create=mfs, minfreespace)"
+    # Set POOL_DISKS to a colon-separated list of mounted member paths, e.g.
+    #   POOL_DISKS=/mnt/disk1:/mnt/disk2 sudo scripts/server-prep pool
+    apt-get install -y mergerfs
+    local members=${POOL_DISKS:-}
+    [ -n "$members" ] || { echo "set POOL_DISKS=/mnt/disk1:/mnt/disk2 (mounted members)"; return 1; }
+    mkdir -p /srv/pool
+    local opts="defaults,allow_other,use_ino,category.create=mfs,minfreespace=${POOL_MINFREE:-50G}"
+    if ! grep -q ' /srv/pool ' /etc/fstab; then
+        echo "$members /srv/pool fuse.mergerfs $opts 0 0" >> /etc/fstab
+    fi
+    systemctl daemon-reload
+    mount /srv/pool 2>/dev/null || mount -t fuse.mergerfs -o "$opts" "$members" /srv/pool
+    df -h /srv/pool
+}
+
+step_appdata() {
+    echo "== appdata: ensure /DATA/AppData exists for local DBs"
+    install -d -o "$USER_NAME" -g "$USER_NAME" /DATA /DATA/AppData
+    # Optional: bind-mount a fast local volume over /DATA/AppData if you keep
+    # app state off the root filesystem. Left as a manual fstab edit.
+    ls -ld /DATA/AppData
+}
+
+step_alerts() {
+    echo "== alerts: SMART + RAID/backup failures -> ntfy"
+    local sys="$ROOT/system"
+    apt-get install -y --no-install-recommends smartmontools
+    install -m 755 "$sys/ntfy-send" /usr/local/bin/ntfy-send
+    install -m 755 "$sys/mdadm-ntfy" "$sys/smartd-ntfy" /usr/local/sbin/
+    install -m 644 "$sys/smartd.conf" /etc/smartd.conf
+    install -m 644 "$sys/notify-failure@.service" "$sys/server-backup.service" /etc/systemd/system/
+    grep -q '^PROGRAM ' /etc/mdadm/mdadm.conf ||
+        echo 'PROGRAM /usr/local/sbin/mdadm-ntfy' >> /etc/mdadm/mdadm.conf
+    sed -i 's/^MAILADDR /#&/' /etc/mdadm/mdadm.conf
+    systemctl daemon-reload
+    systemctl enable smartmontools.service
+    systemctl restart smartmontools.service mdmonitor.service
+
+    mdadm --monitor --scan --oneshot --test || true
+    SMARTD_FAILTYPE=EmailTest SMARTD_DEVICE=all SMARTD_FULLMESSAGE="smartd self-test alert" \
+        /usr/local/sbin/smartd-ntfy
+}
+
+step_dirs() {
+    echo "== dirs"
+    install -d -o "$USER_NAME" -g "$USER_NAME" /opt/stacks /DATA /DATA/AppData
+    ls -ld /opt/stacks /DATA/AppData
+}
+
+case "${1:-all}" in
+    docker) step_docker ;;
+    disks)  step_disks ;;
+    nfs)    step_nfs ;;
+    dirs)   step_dirs ;;
+    firewall) step_firewall ;;
+    backup) step_backup ;;
+    alerts) step_alerts ;;
+    sysctl) step_sysctl ;;
+    pool)   step_pool ;;
+    appdata) step_appdata ;;
+    all)    step_docker; step_sysctl; step_firewall; step_dirs; step_disks; step_backup ;;
+    *) echo "usage: $0 [docker|disks|nfs|dirs|firewall|backup|alerts|sysctl|pool|appdata|all]"; exit 1 ;;
+esac

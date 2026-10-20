@@ -1,0 +1,19 @@
+# Homepage dashboard.
+# Widget config lives in /DATA/AppData/homepage/config (services.yaml, etc.).
+name: homepage
+services:
+  homepage:
+    image: ghcr.io/gethomepage/homepage:latest
+    container_name: homepage
+    restart: unless-stopped
+    ports:
+      - "${HOMEPAGE_PORT:-3000}:3000"
+    volumes:
+      - /DATA/AppData/homepage/config:/app/config
+      - /DATA/AppData/homepage/config/icons:/app/public/icons:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /DATA:/DATA:ro
+      - ${HOMEPAGE_STORAGE_RO:-/srv/pool}:/storage:ro
+    environment:
+      - TZ=${TZ:-UTC}
+      - HOMEPAGE_ALLOWED_HOSTS=${HOMEPAGE_ALLOWED_HOSTS:-server.example.ts.net,10.0.0.10}

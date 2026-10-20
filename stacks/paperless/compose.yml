@@ -1,0 +1,37 @@
+# Paperless-ngx document archive.
+# SQLite DB in data/; documents (media/consume/export) on pool or NAS.
+# Secrets in .env: PAPERLESS_SECRET_KEY, PAPERLESS_ADMIN_PASSWORD.
+name: paperless
+services:
+  broker:
+    image: redis:7-alpine
+    container_name: paperless-redis
+    restart: unless-stopped
+    volumes:
+      - /DATA/AppData/paperless/redis:/data
+
+  webserver:
+    image: ghcr.io/paperless-ngx/paperless-ngx:latest
+    container_name: paperless-webserver
+    restart: unless-stopped
+    depends_on:
+      - broker
+    ports:
+      - "${PAPERLESS_PORT:-8010}:8000"
+    environment:
+      - PAPERLESS_REDIS=redis://paperless-redis:6379
+      - PAPERLESS_ADMIN_USER=${PAPERLESS_ADMIN_USER:-admin}
+      - PAPERLESS_ADMIN_PASSWORD=${PAPERLESS_ADMIN_PASSWORD:?set in .env}
+      - PAPERLESS_ADMIN_EMAIL=${PAPERLESS_ADMIN_EMAIL:-admin@example.com}
+      - PAPERLESS_TIME_ZONE=${TZ:-UTC}
+      - PAPERLESS_OCR_LANGUAGE=eng
+      - PAPERLESS_SECRET_KEY=${PAPERLESS_SECRET_KEY:?set in .env}
+      # Mesh HTTPS origin from scripts/tailscale-serve; without it CSRF fails on that URL.
+      - PAPERLESS_CSRF_TRUSTED_ORIGINS=${PAPERLESS_CSRF_TRUSTED_ORIGINS:-https://server.example.ts.net:18010}
+      - USERMAP_UID=${USERMAP_UID:-1000}
+      - USERMAP_GID=${USERMAP_GID:-1000}
+    volumes:
+      - /DATA/AppData/paperless/data:/usr/src/paperless/data
+      - ${PAPERLESS_MEDIA:-/srv/pool/documents/media}:/usr/src/paperless/media
+      - ${PAPERLESS_EXPORT:-/srv/pool/documents/export}:/usr/src/paperless/export
+      - ${PAPERLESS_CONSUME:-/srv/pool/documents/consume}:/usr/src/paperless/consume

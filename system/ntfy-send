@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Push an alert through the ntfy container (stacks/ntfy).
+# Installed to /usr/local/bin by `sudo scripts/server-prep alerts`.
+#   ntfy-send [-p min|low|default|high|urgent] [-t tag,tag] TITLE [MESSAGE]
+# MESSAGE defaults to stdin. Never fails its caller: if ntfy is unreachable the
+# alert goes to the journal instead (journalctl -t ntfy-send).
+set -uo pipefail
+
+TOPIC=${NTFY_TOPIC:-homelab-alerts}
+URL=${NTFY_URL:-http://127.0.0.1:8093/${TOPIC}}
+prio=default tags=""
+while getopts p:t: o; do
+    case $o in p) prio=$OPTARG ;; t) tags=$OPTARG ;; *) exit 2 ;; esac
+done
+shift $((OPTIND - 1))
+title=${1:?usage: ntfy-send [-p prio] [-t tags] TITLE [MESSAGE]}
+if [ $# -ge 2 ]; then msg=$2; else msg=$(cat); fi
+[ -n "$msg" ] || msg=$title
+
+curl -fsS -m 10 -o /dev/null -H "Title: $title" -H "Priority: $prio" ${tags:+-H "Tags: $tags"} \
+     --data-binary "$msg" "$URL" ||
+    logger -t ntfy-send -p user.err "ntfy unreachable; alert was: $title: $msg"
+exit 0

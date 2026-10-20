@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# Nightly backup of app state to the RAID1 at /srv/backup.
+# Runs as root from server-backup.timer (installed by `sudo scripts/server-prep backup`).
+# Run by hand: sudo systemctl start server-backup  (log: journalctl -u server-backup)
+#
+# What it keeps (KEEP days of each):
+#   immich/immich-<date>.sql.gz   pg_dumpall of Immich's Postgres
+#   snapshots/<date>/AppData      /DATA/AppData, minus caches and raw pgdata
+#   snapshots/<date>/stacks       /opt/stacks, including the .env secrets
+# Snapshots hard-link unchanged files to the previous day's, so each extra day
+# only costs what changed. Large originals on a separate NAS are not copied
+# unless PHOTO_SRC is set (optional second copy onto local pool storage).
+set -euo pipefail
+
+# Canonicalize an override path and refuse anything outside the allowed prefixes
+# before rsync --delete / find -exec rm -rf. `/` is a mountpoint, so a bare
+# mountpoint check is not enough.
+require_path_under() {
+    local raw=$1
+    shift
+    local canon prefix
+    # -m: resolve ".." even when the path does not exist yet.
+    canon=$(realpath -m "$raw")
+    for prefix in "$@"; do
+        prefix=$(realpath -m "$prefix")
+        case "$canon" in
+            "$prefix"|"$prefix"/*) printf '%s\n' "$canon"; return 0 ;;
+        esac
+    done
+    echo "refusing path '$raw' (resolves to '$canon'; expected under $*)" >&2
+    return 1
+}
+
+require_positive_int() {
+    local name=$1 val=$2
+    case "$val" in
+        ''|*[!0-9]*) echo "$name must be a positive integer" >&2; exit 1 ;;
+    esac
+    [ "$val" -ge 1 ] || { echo "$name must be >= 1" >&2; exit 1; }
+}
+
+DEST=$(require_path_under "${BACKUP_DEST:-/srv/backup}" /srv/backup)
+KEEP=${BACKUP_KEEP:-14}
+require_positive_int BACKUP_KEEP "$KEEP"
+TODAY=$(date +%F)
+
+mountpoint -q "$DEST" || { echo "$DEST is not mounted, refusing to fill the root disk"; exit 1; }
+
+# --- Immich database -------------------------------------------------------
+mkdir -p "$DEST/immich"
+docker exec immich_postgres pg_dumpall --clean --if-exists -U postgres \
+    | gzip > "$DEST/immich/immich-$TODAY.sql.gz.tmp"
+mv "$DEST/immich/immich-$TODAY.sql.gz.tmp" "$DEST/immich/immich-$TODAY.sql.gz"
+
+# --- File snapshots --------------------------------------------------------
+mkdir -p "$DEST/snapshots"
+snap="$DEST/snapshots/$TODAY"
+mkdir -p "$snap"
+prev=$(find "$DEST/snapshots" -mindepth 1 -maxdepth 1 -type d ! -name "$TODAY" | sort | tail -1)
+[ -n "$prev" ] && [ ! -d "$prev/AppData" ] && prev=""
+link=()
+[ -n "$prev" ] && link=(--link-dest="$prev/AppData")
+
+rsync -a --delete "${link[@]}" \
+    --exclude='/immich/pgdata/' \
+    --exclude='/immich/model-cache/' \
+    --exclude='/photoprism/storage/cache/' \
+    /DATA/AppData/ "$snap/AppData/"
+
+link=()
+[ -n "$prev" ] && link=(--link-dest="$prev/stacks")
+rsync -a --delete "${link[@]}" /opt/stacks/ "$snap/stacks/"
+
+# Replace SQLite copies with consistent online backups.
+python3 - "$snap/AppData" <<'EOF'
+import os, sqlite3, sys
+snap = sys.argv[1]
+src_root = "/DATA/AppData"
+for dirpath, _, files in os.walk(snap):
+    for f in files:
+        if not f.endswith((".db", ".sqlite", ".sqlite3")):
+            continue
+        dst = os.path.join(dirpath, f)
+        src = os.path.join(src_root, os.path.relpath(dst, snap))
+        try:
+            s = sqlite3.connect(f"file:{src}?mode=ro", uri=True, timeout=30)
+            tmp = dst + ".tmp"
+            d = sqlite3.connect(tmp)
+            s.backup(d)
+            d.close(); s.close()
+            st = os.stat(src)
+            os.chown(tmp, st.st_uid, st.st_gid); os.chmod(tmp, st.st_mode)
+            os.replace(tmp, dst)
+        except sqlite3.DatabaseError:
+            pass
+EOF
+touch "$snap"
+
+# --- Retention ---------------------------------------------------------------
+find "$DEST/immich" -name 'immich-*.sql.gz' -mtime +"$KEEP" -delete
+find "$DEST/snapshots" -mindepth 1 -maxdepth 1 -type d -mtime +"$KEEP" -exec rm -rf {} +
+
+echo "backup $TODAY done: $(du -sh "$snap" | cut -f1) snapshot, $(du -sh "$DEST/immich/immich-$TODAY.sql.gz" | cut -f1) Immich dump, $(df -h --output=avail "$DEST" | tail -1 | tr -d ' ') free"
+
+# --- Optional: photo originals -> local pool ---------------------------------
+# NAS redundancy covers a dead drive, not deletion or a dead NAS. When set,
+# PHOTO_SRC is mirrored to PHOTO_DEST with a deleted/ holding recent removals.
+PHOTO_SRC=${PHOTO_SRC:-}
+PHOTO_DEST=${PHOTO_DEST:-/srv/pool/photo-backup}
+PHOTO_KEEP=${PHOTO_KEEP:-60}
+PHOTO_USER=${PHOTO_USER:-${DEPLOY_USER:-deploy}}
+photos_failed=""
+if [ -n "$PHOTO_SRC" ]; then
+    PHOTO_DEST=$(require_path_under "$PHOTO_DEST" /srv/pool /srv/backup)
+    require_positive_int PHOTO_KEEP "$PHOTO_KEEP"
+    if ! mountpoint -q "$(dirname "$PHOTO_DEST")" && ! mountpoint -q /srv/pool; then
+        echo "PHOTOS: pool/dest not mounted"; photos_failed=1
+    elif [ -z "$(ls -A "$PHOTO_SRC" 2>/dev/null)" ]; then
+        echo "PHOTOS: $PHOTO_SRC missing or empty, skipping"; photos_failed=1
+    else
+        install -d -o "$PHOTO_USER" -g "$PHOTO_USER" "$PHOTO_DEST" "$PHOTO_DEST/current" "$PHOTO_DEST/deleted"
+        rc=0
+        runuser -u "$PHOTO_USER" -- rsync -rlt --delete --backup --backup-dir="$PHOTO_DEST/deleted/$TODAY" \
+            --exclude='/thumbs/' --exclude='/encoded-video/' \
+            "$PHOTO_SRC/" "$PHOTO_DEST/current/" || rc=$?
+        if [ "$rc" -ne 0 ] && [ "$rc" -ne 24 ]; then
+            echo "PHOTOS: rsync failed with exit $rc"; photos_failed=1
+        fi
+        find "$PHOTO_DEST/deleted" -mindepth 1 -maxdepth 1 -type d -mtime +"$PHOTO_KEEP" -exec rm -rf {} +
+        echo "photos $TODAY done: $(du -sh "$PHOTO_DEST/current" | cut -f1) copied"
+    fi
+fi
+
+# --- Off-box copy ------------------------------------------------------------
+# Pushes today's snapshot and dump to a second host (set up by scripts/offbox-setup).
+# Key is limited to rrsync -wo -no-del. --fake-super keeps owners in xattrs.
+OFFBOX_HOSTS=${OFFBOX_HOSTS:-offbox.example.ts.net}
+OFFBOX_KEY=${OFFBOX_KEY:-/root/.ssh/offbox_ed25519}
+[ -f "$OFFBOX_KEY" ] || exit "${photos_failed:-0}"
+
+ssh_cmd="ssh -i $OFFBOX_KEY -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -l offbox"
+link=()
+for d in $(find "$DEST/snapshots" -mindepth 1 -maxdepth 1 -type d ! -name "$TODAY" -printf '%f\n' | sort -r | head -7); do
+    link+=(--link-dest="/snapshots/$d/")
+done
+
+offbox_ok=""
+for h in $OFFBOX_HOSTS; do
+    if rsync -a --numeric-ids -M--fake-super -e "$ssh_cmd" "${link[@]}" "$snap/" "$h:snapshots/$TODAY/" \
+        && rsync -a --numeric-ids -M--fake-super -e "$ssh_cmd" "$DEST/immich/immich-$TODAY.sql.gz" "$h:immich/"; then
+        offbox_ok=$h; break
+    fi
+done
+if [ -z "$offbox_ok" ]; then
+    echo "OFF-BOX COPY FAILED: receiver unreachable or rejected the push"
+    exit 1
+fi
+echo "off-box copy $TODAY done via $offbox_ok"
+[ -z "$photos_failed" ]

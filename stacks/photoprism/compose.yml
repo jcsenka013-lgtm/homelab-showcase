@@ -1,0 +1,19 @@
+# PhotoPrism: alternate browser / index over photo originals.
+# SQLite index + thumbnail cache in local storage/; originals on pool or NAS.
+# PHOTOPRISM_ADMIN_PASSWORD in .env next to this file (not in git).
+name: photoprism
+services:
+  photoprism:
+    image: photoprism/photoprism:latest
+    container_name: photoprism
+    hostname: photoprism
+    restart: unless-stopped
+    ports:
+      - "${PHOTOPRISM_PORT:-2342}:2342"
+    environment:
+      PHOTOPRISM_ADMIN_PASSWORD: ${PHOTOPRISM_ADMIN_PASSWORD:?set in .env}
+      PHOTOPRISM_UPLOAD_NSFW: "true"
+      TZ: ${TZ:-UTC}
+    volumes:
+      - /DATA/AppData/photoprism/storage:/photoprism/storage
+      - ${PHOTOPRISM_ORIGINALS:-/srv/pool/photo-originals}:/photoprism/originals
